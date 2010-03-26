@@ -1,0 +1,1158 @@
+#! /usr/bin/perl
+
+#TODO: .v has to be able to print the contents of arrays as well!
+
+###
+###  5 was conceived by Bernd Ulmann (starting in August 2009).
+###
+### Revision history - cf. quick reference guide:
+###  28-AUG-2009, 10-OCT-2009, 14-OCT-2009, 19-OCT-2009, 20-OCT-2009, 21-OCT-2009, 22-OCT-2009, 29-OCT-2009, 08-NOV-2009,
+###  09-NOV-2009, 13-NOV-2009, 14-NOV-2009, 15-NOV-2009, 16-NOV-2009, 20-NOV-2009, 21-NOV-2009, 17-JAN-2010, 24-JAN-2010,
+###  25-JAN-2010, 26-JAN-2010, 27-JAN-2010, 28-JAN-2010, 30-JAN-2010, 31-JAN-2010, 10-FEB-2010, 23-FEB-2010, 27-FEB-2010,
+###  02-MAR-2010, 06-MAR-2010, 07-MAR-2010, 08-MAR-2010, 09-MAR-2010, 14-MAR-2010, 
+###
+
+use strict;
+use warnings;
+
+use File::Basename;
+use Getopt::Long;
+use Storable qw(dclone);
+use Data::Dumper;
+$Data::Dumper::Varname = undef;
+
+# States for the interpreter's state machine:
+my $STATE_RUN                  = 0;
+my $STATE_START_WORD           = 1;
+my $STATE_EXPAND_WORD          = 2;
+my $STATE_SKIP_WORD_DEFINITION = 3;
+my $STATE_EXECUTE_IF           = 4;
+my $STATE_EXECUTE_ELSE         = 5;
+my $STATE_IF_COMPLETED         = 6;
+my $STATE_EXECUTE_DO           = 7;
+my $BREAK_EXECUTED             = 8;
+
+my $version = '0.3';
+my ($debug,                         # If set to 1 the interpreter prints out a lot of debug informtion.
+    $interactive,                   # If set to 1 the interpreter will be run interactively.
+    @data_stack,                    # The central data structure, the stack.
+    %words,                         # This hash contains all user defined words.
+    %variables,                     # This is the place where 5-variables are stored.
+    @execution_history,             # This array contains the last 10 executed words / functions / operators.
+    $leave_interpreter_immediately, # If set to 1, the interpreter loop is left after the current word and recursion winds up.
+    %statistics,                    # Hash containing some statistics information (number of words executed and the like).
+    $exit_executed,                 # Quite like $leave_interpreter_immediately, but this also leaves the interactive loop.
+    %file_handles);                 # Hash containing the handles for all files opened from within a 5-program.
+my $terminal_width = 80;
+
+# All builtin binary words are defined here:
+my %bin_op =
+(
+    split => sub # Split a string and place its parts into a vector.
+    {
+        panic("split: The two topmost stack elements are not both scalar!") and return if ref($_[0]) or ref($_[1]);
+        [split($_[0], $_[1])];
+    },
+);
+$bin_op{$_} = eval("sub {\$_[1] $_ \$_[0]}") for qw(+ - * / & | ^ > < == >= <= != <=> cmp % ** eq ne gt lt ge le && || and or);
+
+# All builtin unary words are defined here:
+my %un_op =
+(
+    '!'       => sub { factorial($_[0]); },
+    '?'       => sub { rand($_[0]); },
+    'defined' => sub { defined($_[0]) || 0; },
+    'eval'    => sub { $variables{$_[0]}; },
+    'int'     => sub { int($_[0]); },
+    'iota'    => sub # Generate a vector with unit stride starting at 0 and ending with TOS value - 1.
+    {
+        panic("iota: TOS is not a positive integer!") and return unless $_[0] =~ m/^[+]?\d+$/;
+        [(0..$_[0] - 1)];
+    },
+    'neg'     => sub { -$_[0]; },
+    'not'     => sub { !$_[0]; },
+    'system'  => sub 
+    {
+        my ($command) = @_;
+        panic("system: TOS is not scalar!") and return if ref($command);
+        $command =~ s/^\"//;
+        $command =~ s/\"$//;
+        [map{ local $_ = $_; chomp; $_ }(`$command`)];
+    },
+);
+$un_op{$_} = eval("sub {$_ \$_[0]}") for qw(sin cos sqrt);
+
+# All builtin niladic words are defined here:
+my %niladic = 
+(
+    'depth' => sub { @data_stack + 0; },
+    'exit'  => sub { $exit_executed = 1; },
+    'vlist' => sub { [sort(keys(%variables))]; },
+    'ver'   => sub { $version; },
+    'wlist' => sub { [sort(keys(%words))]; },
+);
+
+my %functions =
+(
+    '..' => sub # For internal use only. :-)
+    {
+        print Dumper(\@data_stack);
+    },
+    '.' => sub # Remove TOS and print it.
+    {
+        check_stack('.', 'X') or return;
+        my $suppress_crlf = print_element(pop(@data_stack));
+        print "\n" unless $suppress_crlf;
+    },
+    '.ofw' => sub # Print a list of all defined words etc.
+    {
+        print_words();
+    },
+    'close' => sub # Close a file which has been opened before.
+    {
+        check_stack('close', 'S') or return;
+        my $file_name = pop(@data_stack);
+        $file_name =~ s/^"(.*)"$/$1/;
+        print "\t>>> close $file_name.\n" if $debug;
+        unless ($file_handles{$file_name})
+        {
+            print "close: No such file to close: $file_name\n";
+            $leave_interpreter_immediately = 1;
+        }
+        else
+        {
+            close($file_handles{$file_name});
+            delete($file_handles{$file_name});
+        }
+    },
+    'compress' => sub # Compress data found on the stack into a structure.
+    {
+        check_stack('compress', 'SX') or return;
+        my $length = pop @data_stack;
+
+        panic("compress: Not enough elements on stack(2)!") and return if @data_stack < $length;
+        my @structure;
+        unshift @structure, pop @data_stack for (1..$length);
+        push(@data_stack, \@structure);
+    },
+    'del' => sub # Delete a variable or a word (if it does not exists nothing will happen).
+    {
+        check_stack('del', 'S') or return;
+        my $name = pop @data_stack;
+        if (defined($variables{$name}))
+        {
+            delete($variables{$name});
+        }
+        elsif (defined($words{$name}))
+        {
+            delete($words{$name});
+        }
+        else
+        {
+            print "There is no word or variable named '$name'!\n";
+        }
+        print "\t>>> Deleted variable $name.\n" if $debug;
+    },
+    'drop' => sub # Drop the TOS.
+    {
+        check_stack('drop', 'X') or return;
+        pop @data_stack;
+    },
+    'dup' => sub # Duplicate the TOS.
+    {
+        check_stack('dup', 'X') or return;
+        my $data = ref($data_stack[-1]) ? dclone($data_stack[-1]) : $data_stack[-1];
+        push(@data_stack, $data);
+    },
+    'dump>>' => sub # Dump a variable or word into a file using append mode. TOS contains the filename, TOS - 1 the object's name.
+    {
+        check_stack('dump>>', 'SN') or return;
+        my ($file_name, $element) = (pop(@data_stack), pop(@data_stack));
+        open my $dh, '>>', $file_name or (panic("Could not open file '$file_name' for append!") and return);
+        if (defined($words{$element})) # Dump a word...
+        {
+            my $function = explain_word($dh);
+            print $dh ": $element\n  ";
+            $function->($words{$element});
+            print $dh "\n;\n\n";
+        }
+        else # Dump a variable
+        {
+            print $dh "$variables{$element} '$element set\n";
+        }
+        close($dh);
+    },
+    'eof' => sub # Push 1 on the TOS if the next fread would fail due to eof.
+    {
+        check_stack('eof', 'S') or return;
+        my $file_name = pop(@data_stack);
+        $file_name =~ s/^"(.*)"$/$1/;
+        print "\t>>> eof with file $file_name.\n" if $debug;
+        my $file_handle = $file_handles{$file_name};
+        unless($file_handle)
+        {
+            print "eof: File $file_name has not been opened before calling f.\n";
+            $leave_interpreter_immediately = 1;
+            return;
+        }
+
+        push(@data_stack, eof($file_handle));
+    },
+    'execute' => sub # Execute an operator or function or word found on the TOS.
+    {
+        check_stack('execute', 'S') or return;
+        my @prog;
+        my $operation = pop(@data_stack);
+        $operation =~ s/^"(.*)"$/$1/;
+        push(@prog, $operation);
+        execute_program(\@prog, 0);
+    },
+    'expand' => sub # Expand a structure to the next deeper level.
+    {
+        check_stack('expand', 'A') or return;
+        my ($data, $count) = (pop @data_stack, 0);
+        for my $d (@$data)
+        {
+            push(@data_stack, $d);
+            $count++;
+        }
+        push(@data_stack, $count);
+    },
+    'explain' => sub # Print a word definition (valid only for user defined words)
+    {
+        check_stack('explain', 'X') or return;
+        my $element = pop(@data_stack);
+        panic("$element is not a user defined word!") and return unless $words{$element};
+
+        my $function = explain_word();
+        print ": $element\n  ";
+        $function->($words{$element});
+        print "\n;\n";
+    },
+    'f.' => sub # Write TOS-1 to the file which name is specified in TOS.
+    {
+        check_stack('f.', 'SX') or return;
+        my $file_name = pop(@data_stack);
+        $file_name =~ s/^"(.*)"$/$1/;
+        print "\t>>> f. with file $file_name.\n" if $debug;
+        my $file_handle = $file_handles{$file_name};
+        unless($file_handle)
+        {
+            print "f.: File $file_name has not been opened before calling f.\n";
+            $leave_interpreter_immediately = 1;
+            return;
+        }
+
+        my $suppress_crlf = print_element(pop(@data_stack), $file_handles{$file_name});
+        print $file_handle "\n" unless $suppress_crlf;
+    },
+    'fread' => sub # Read a record from a file and push it on top of the stack.
+    {
+        my $file_name = pop(@data_stack);
+        $file_name =~ s/^"(.*)"$/$1/;
+        print "\t>>> Read data from file $file_name.\n" if $debug;
+        unless ($file_handles{$file_name})
+        {
+            print "fread: File $file_name has not been opened before!\n";
+            $leave_interpreter_immediately = 1;
+        }
+        else
+        {
+            my $handle = $file_handles{$file_name};
+            my $value = <$handle>;
+            chomp $value;
+            push(@data_stack, $value);
+        }
+    },
+    'grade' => sub # Generate an index vector for sorting the elements of a vector.
+    {
+        check_stack('grade', 'A') or return;
+
+        my %h;
+        my $data = pop(@data_stack);
+        $h{$_} = $data->[$_] for (0 .. @$data - 1);
+        push(@data_stack, [sort{$h{$a} <=> $h{$b}}(keys(%h))]);
+    },
+    'in' => sub # Set operation 'in' - returns a structure consisting of 0 and 1.
+    {
+        check_stack('in', 'XA') or return;
+        my ($a1, $a2, @res) = (pop @data_stack, pop @data_stack);
+
+        if (ref($a1))
+        {
+            push(@res, is_in($_, $a2)) for (@$a1);
+            push(@data_stack, \@res);
+        }
+        else
+        {
+            push(@data_stack, is_in($a1, $a2));
+        }
+    },
+    'join' => sub # Concatenate elements of a vector forming a string.
+    {
+        check_stack('join', 'SA') or return;
+        my $glue = pop @data_stack;
+        $glue =~ s/^"(.*)"$/$1/;
+        my $result = join($glue, map{ local $_ = $_; s/^\"(.*)\"$/$1/; $_ }(@{pop @data_stack}));
+        $result =~ s/^(.*)$/\"$1\"/ if $result =~ m/^[^"].*[^"]$/;
+        push(@data_stack, $result);
+    },
+    'length' => sub 
+    {
+        check_stack('length', 'A') or return;
+        my $tos = pop(@data_stack);
+        push(@data_stack, @$tos + 0);
+    },
+    'load' => sub # Load a program from a file
+    {
+        check_stack('load', 'S') or return;
+        my $file_name = pop(@data_stack);
+        print "\t>>> Load program from file $file_name.\n" if $debug;
+        open my $fh, '<', $file_name or (panic("Unable to load from '$file_name'") and return);
+
+        my @prog;
+        while (my $line = <$fh>)
+        {
+            next unless $line;
+            push(@prog, parse_source_line($line));
+        }
+        close($fh);
+
+        execute_program(\@prog, 0);
+    },
+    'open' => sub # Open a file and store its handle in a hash for later use.
+    {
+        check_stack('open', 'SS') or return;
+        my $file_name = pop(@data_stack);
+        $file_name =~ s/^"(.*)"$/$1/;
+        my $mode = pop(@data_stack);
+        print "\t>>> Open $file_name with mode '$mode'...\n" if $debug;
+        if ($mode !~ m/^[+<>]{1,3}$/)
+        {
+            print "open: No valid mode specified on file $file_name: $mode!\n";
+            $leave_interpreter_immediately = 1;
+        }
+        elsif ($file_handles{$file_name}) # File has been already opened!
+        {
+            print "open: File $file_name has been already opened before!\n";
+            $leave_interpreter_immediately = 1;
+        }
+        else
+        {
+            open(my $handle, $mode, $file_name);
+            unless ($handle)
+            {
+                print "open: Unable to open $file_name with mode '$mode': $!\n";
+                $leave_interpreter_immediately = 1;
+                return;
+            }
+
+            $file_handles{$file_name} = $handle;
+        }
+    },
+    'outer' => sub # Perform an outer 'product' operation although any builtin binary word can be used as the basis for this.
+    {
+        check_stack('outer', 'BAA') or return;
+        my ($op ,$a1, $a2, @res) = (pop @data_stack, pop @data_stack, pop @data_stack);
+
+        for my $i (0 .. @$a1-1) 
+        {
+            $res[$i][$_] = ($bin_op{$op}->($a1->[$i], $a2->[$_]) || 0) for (0 .. @$a2 - 1);
+        }
+        push(@data_stack, \@res);
+    },
+    'over' => sub # Push TOS - 1 onto the stack.
+    {
+        check_stack('over', 'XX') or return;
+        my $data = ref($data_stack[-2]) ? dclone($data_stack[-2]) : $data_stack[-2];
+        push(@data_stack, $data);
+    },
+    'panic' => sub # Print TOS and leave current interpreter loop immediately!
+    {
+        print 'PANIC: ';
+        if (check_stack('panic', 'X')) 
+        {
+            my $suppress_crlf = print_element(pop(@data_stack));
+            print "\n" unless $suppress_crlf;
+        }
+        print "\n";
+        $leave_interpreter_immediately = 1; # We must remember that something horrible happened since we do not know how deeply nested
+                             # we are currently executing. $leave_interpreter_immediately will be reset at the entry of execute.
+    },
+    'read' => sub # Read a record from stdin and push it on top of the stack.
+    {
+        print "\t>>> Read data from STDIN.\n" if $debug;
+        my $value = <STDIN>;
+        chomp $value;
+        push(@data_stack, $value);
+    },
+    'reduce' => sub # Reduce a vector to a scalar by applying a binary word to all vector elements (cf. APL's '/').
+    {
+        check_stack('reduce', 'BA') or return;
+        my $operator = pop @data_stack;
+        push(@data_stack, eval(join($operator, @{pop(@data_stack)})));
+    },
+    'remove' => sub # Remove elements from a nested structure found at TOS and controlled by a structure found at TOS - 1.
+    {
+        check_stack('remove', 'XA') or return;
+        my $list = pop @data_stack;
+        if (ref($list)) 
+        {
+            for my $el (@$list) 
+            {
+                if (ref($el)) 
+                {
+                    eval('$data_stack[-1]' . join('', map { "[$_]" } @$el) . '= undef');
+                } 
+                else 
+                {
+                    $data_stack[-1][$el] = undef;
+                }
+            }
+        } 
+        else 
+        {
+            $data_stack[-1][$list] = undef;
+        }
+        purge($data_stack[-1]);
+    },
+    'reverse' => sub # Reverse the elements of a vector.
+    {
+        check_stack('reverse', 'A') or return;
+        push(@data_stack, [reverse(@{pop @data_stack})]);
+    },
+    'rot' => sub # 1 2 3 -> 2 3 1
+    {
+        check_stack('rot', 'XXX') or return;
+        ($data_stack[-1], $data_stack[-2], $data_stack[-3]) = ($data_stack[-3], $data_stack[-1], $data_stack[-2]);
+    },
+    'select' => sub # Select elements from a nested structure (TOS - 1) controlled by a selector structure (TOS).
+    {
+        check_stack('select', 'AA') or return;
+        my ($a1, $a2, @res) = (pop @data_stack, pop @data_stack);
+
+        for my $i (0 .. @$a2 - 1)
+        {
+            push(@res, $a2->[$i]) if $a1->[$i];
+        }
+        push(@data_stack, \@res);
+    },
+    'set' => sub # Set and, if necessary, define a variable.
+    {
+        check_stack('set', 'SX') or return;
+        my $name = pop(@data_stack);
+        panic("Variable name '$name' conflicts with a word of the same name!") and return if defined($words{$name});
+        $variables{$name} = pop @data_stack;
+        print "\t>>> Setting variable '$name' to value '$variables{$name}'.\n" if $debug;
+    },
+    'subscript' => sub # Select elements from an array determined by their respective index numbers.
+    {
+        check_stack('index', 'XA') or return;
+        my ($a1, $a2, @res) = (pop @data_stack, pop @data_stack);
+        $a1 = [$a1] unless ref($a1);
+
+        push(@res, $a2->[$_]) for (@$a1);
+        push(@data_stack, \@res);
+    },
+    'swap' => sub # Swap TOS and TOS - 1.
+    {
+        check_stack('swap', 'XX') or return;
+        ($data_stack[-1], $data_stack[-2]) = ($data_stack[-2], $data_stack[-1]);
+    },
+    'type' => sub # Determine type of TOS-element.
+    {
+        check_stack('type', 'X') or return;
+        my $word_list = create_word_list();
+        my $element = pop(@data_stack);
+        if (defined($word_list->{$element}))
+        {
+            push(@data_stack, $word_list->{$element} ne ' ' ? $word_list->{$element} : 'W');
+        }
+        elsif (defined($variables{$element})) # What was found is the name of a variable.
+        {
+            push(@data_stack, 'V');
+        }
+        else
+        {
+            push(@data_stack, ref($element) ? 'A' : 'S');
+        }
+    },
+    'unlink' => sub # Delete a file...
+    {
+        check_stack('unlink', 'S') or return;
+        my $file_name = pop(@data_stack);
+        $file_name =~ s/^"(.*)"$/$1/;
+        print "\t>>> unlink $file_name.\n" if $debug;
+        unlink($file_name);
+    }
+);
+
+# Recursively dump a word definition. The closure was needed to keep track of the current cursor position.
+sub explain_word
+{
+    my ($handle) = @_;
+    $handle = *STDOUT unless $handle;
+
+    my $position = 0;
+    my $function;
+
+    $function = sub
+    {
+        my ($ref) = @_;
+        my ($returned_from_recursion, $last_control_instruction) = (0, '');
+
+        for my $part (@$ref)
+        {
+            if ($returned_from_recursion)
+            {
+                print $handle 'then ' if ($last_control_instruction eq 'else') or 
+                                         ($last_control_instruction eq 'if' and $part ne 'else');
+                print $handle 'loop ' if $last_control_instruction eq 'do';
+                $position += 5;
+                ($returned_from_recursion, $last_control_instruction) = (0, '');
+            }
+
+            unless(ref($part))
+            {
+                $position += length($part) + 1;
+                print $handle "\n  " and $position = 2 if $position > $terminal_width - 5;
+                print $handle "$part ";
+                $last_control_instruction = $part if $part eq 'if' or $part eq 'else' or $part eq 'do';
+            }
+            else
+            {
+                $function->($part);
+                $returned_from_recursion = 1;
+            }
+        }
+
+        if ($returned_from_recursion)
+        {
+            print $handle 'then ' if $last_control_instruction eq 'else' or $last_control_instruction eq 'if';
+            print $handle 'loop ' if $last_control_instruction eq 'do';
+            $position += 5;
+        }
+    };
+
+    return $function;
+}
+
+sub create_word_list
+{
+    my %word_list;
+    $word_list{$_} = 'B' for (keys(%bin_op));
+    $word_list{$_} = 'U' for (keys(%un_op));
+    $word_list{$_} = 'N' for (keys(%niladic));
+    $word_list{$_} = 'F' for (keys(%functions));
+    $word_list{$_} = ' ' for (keys(%words));
+
+    return \%word_list;
+}
+
+# Print an evenly spaced multiline list of all user defined words known to the interpreter. Each word is preceded
+# by a letter denoting its type (cf. subroutine word_list).
+sub print_words
+{
+    my $word_list = create_word_list();
+
+    my $i = 0;
+    for my $entry (sort(keys(%$word_list)))
+    {
+        printf "%s:%-12s ", $word_list->{$entry}, $entry;
+        print "\n" if !(++$i % 5);
+    }
+
+    print "\n";
+}
+
+# The following routine is used to signal errors to the user. It differentiates between interactive and batch mode
+# since it will just print the error message and return if run in interactive mode (the calling routine has to make
+# sure that no undesired behaviour will occur after detecting and signaling an error condition). If the interpreter
+# is run in batch mode, panic will die.
+sub panic
+{
+    my ($text) = @_;
+
+    die "$text\n  History: @execution_history\n" unless $interactive;
+    print "$text\n  History: @execution_history\n";
+}
+
+# Check for a given stack structure. The first argument is the name of the calling word, the second argument is a list 
+# containing the letters X (don't care), B (binary word), S (scalar) and A (array) for each element required on the stack.
+# If the conditions are not met, 0 is returned, so check_stack can be used in conjunction with or.
+sub check_stack
+{
+    my ($name, $control) = @_;
+
+    my $i = 0;
+    my %tests = (
+        X => sub { return 0; },
+        S => sub { ref($data_stack[$i]) ? (panic("$name: Element $i is not a scalar!") and return 1) : return 0; },
+        B => sub { exists($bin_op{$data_stack[$i]}) ? 
+            return 0 : (panic("$name: Element $i not a binary operator!") and return 1); },
+        A => sub { ref($data_stack[$i]) ? return 0 : (panic("$name: Element $i is not an array!") and return 1); },
+        N => sub { (!defined($words{$data_stack[$i]}) && !defined($variables{$data_stack[$i]})) ? 
+                       (panic("$name: Element $i is neither a word nor a variable name!") and return 1) : return 0; },
+    );
+
+    panic("$name: Not enough elements on stack") and return 0 if @data_stack < length($control);
+    for my $action (split(//, $control))
+    {
+        --$i;
+        return 0 if $tests{$action}->();
+    }
+
+    return 1; # Everything turned out to be OK.
+}
+
+# Compute the factorial function
+sub factorial { return $_[0] < 2 ? 1 : $_[0] * factorial($_[0] - 1); }
+
+# print_element performs in essence the word "." and traverses deep structures.
+sub print_element
+{
+    my ($data, $handle, $depth) = @_;
+    $depth = 0 unless $depth;
+    $handle = *STDOUT unless $handle;
+
+    unless (ref($data))
+    {
+        if (defined($data) and my ($string) = $data =~ m/^"(.*)"$/) # Are we printing a string?
+        {
+            $string =~ s/\\n/\n/g;
+            $string =~ s/\\t/\t/g;
+            $string =~ s/__CTDQ__/"/g;
+            print $handle $string;
+            return 1; # Suppress CR/LF in calling routine.
+        }
+
+        print $handle defined($data) ? $data : 'undef';
+        return 0;
+    }
+
+    print $handle "\n" if $depth;
+    print $handle ' ' x ($depth * 2), '[';
+    for my $d (@$data)
+    {
+        if (ref($d))
+        {
+            print_element($d, $handle, $depth + 1);
+        }
+        else
+        {
+            if ($d =~ m/^"(.*)"$/)
+            {
+                $d = $1;
+                $d =~ s/\\n/\n/g;
+                $d =~ s/\\t/\t/g;
+            }
+            printf $handle "%4s ", defined($d) ? $d : 'undef';
+        }
+    }
+    print $handle ']';
+
+    return 0;
+}
+
+# Apply an unary word to all elements of a nested structure.
+sub unary 
+{
+    my($func, $data) = @_;
+
+    unless (ref($data))
+    {
+        $_[1] = $func->($data);
+        $_[1] = 0 unless defined($_[1]);
+        return;
+    }
+
+    for my $d (@$data) 
+    {
+        if (ref($d)) 
+        {
+            unary($func, $d);
+        }
+        else 
+        {
+            $d = $func->($d);
+            $d = 0 unless defined($d);
+        }
+    }
+}
+
+# Apply a binary word to a nested data structure.
+sub binary
+{
+    my ($func, $x, $y) = @_;
+
+    if (!ref($x) && !ref($y)) # Scalar op scalar
+    {
+        $_[2] = $func->($x, $y);
+        $_[2] = 0 unless defined($_[2]);
+    }
+    elsif (!ref($x) && ref($y)) # Skalar op vector
+    {
+        for my $d (@$y)
+        {
+            if (ref($d))
+            {
+                binary($func, $x, $d);
+            }
+            else
+            {
+                $d = $func->($x, $d);
+                $d = 0 unless defined($d);
+            }
+        }
+    }
+    elsif (ref($x) && ref($y)) # Vector op vector
+    {
+        for my $d (@$y)
+        {
+            my $e = shift @$x;
+            panic("binary: incompatible structures(short)!") and return if !defined($e);
+            panic("binary: incompatible structures!") and return if ref($d) ne ref($e);
+
+            if (ref($d))
+            {
+                binary($func, $e, $d);
+            }
+            else
+            {
+                $d = $func->($e, $d);
+                $d = 0 unless defined($d);
+            }
+        }
+        panic("binary: incompatible structures(short 2)!") and return if shift @$x;
+    }
+    else
+    {
+        panic("binary: $x, $y -> illegal structure combination!");
+    }
+}
+
+# Return 1 if a scalar element is found in a structure (set operation in).
+sub is_in
+{
+    my($el, $data) = @_;
+
+    for my $d (@$data) 
+    {
+        if (ref($d)) 
+        {
+            return 1 if is_in($el, $d);
+        } 
+        else 
+        {
+            return 1 if $el eq $d;
+        }
+    }
+    return 0;
+}
+
+# Remove all elements from a nested structure which have the value undef.
+# This routine is used for the select operation.
+sub purge {
+    my($aref) = @_;
+
+    for my $i ( reverse(0 .. @$aref-1) ) 
+    {
+        if ( ref($aref->[$i]) eq 'ARRAY') 
+        {
+            purge($aref->[$i]);
+        } 
+        else 
+        {
+           splice(@$aref, $i, 1) unless defined $aref->[$i];
+        }
+    }
+}
+
+# Execute a program - this routine is called for programs as well as for user defined words etc. 'execute' is recursive as 
+# it calls itself on nested structures like user defined words, if-else-then or do-loop constructions.
+sub execute
+{
+    my($program) = @_;
+    my $condition;    # Holds the last condition of an if-else-structure.
+    my $block_result; # Holds the result of an executed program block. This may be undef of BREAK_EXECUTED.
+
+    $leave_interpreter_immediately = 0;
+    print ("\t>>> Stack contents:", Dumper(\@data_stack), "\t>>> Executing program or word: ", Dumper(\@_)) if $debug;
+    my ($name, $state) = (undef, $STATE_RUN);
+    for my $element (@$program)
+    {
+        last if $leave_interpreter_immediately or $exit_executed;
+        push(@execution_history, $element);
+        shift(@execution_history) if @execution_history > 10;
+
+        # If we are in the state $STATE_SKIP_WORD_DEFINITION we will skip source elements until a ';' is found.
+        if ($state == $STATE_SKIP_WORD_DEFINITION)
+        {
+            $state = $STATE_RUN if $element eq ';';
+            next;
+        }
+
+        if ($state == $STATE_IF_COMPLETED)
+        {
+            print "\t>>> State is STATE_IF_COMPLETED\n" if $debug;
+            if ($element eq 'else')
+            {
+                $state = $STATE_EXECUTE_ELSE;
+                next; # Skip the else instruction itself
+            }
+            else
+            {
+                $state = $STATE_RUN;
+            }
+        }
+
+        ### The following block deals with the definition of new words:
+        if ($element eq ';') # End of word definition
+        {
+            die "End of word definition not preceded by word definition!" if $state != $STATE_EXPAND_WORD;
+            $state = $STATE_RUN;
+            print "\t>>> End of definition for word '$name'\n\t\t>>> $name => ", join(' ', @{$words{$name}}), "\n" if $debug;
+        }
+        elsif ($state == $STATE_START_WORD) # Now read the word name
+        {
+            $name = $element;
+            if (defined($variables{$name}))
+            {
+                panic("Word name '$name' conflicts with a variable of the same name!");
+                $state = $STATE_SKIP_WORD_DEFINITION;
+            }
+            $words{$name} = [];
+            $state = $STATE_EXPAND_WORD;
+            print "\t>>> Begin new word '$element'\n" if $debug;
+        }
+        elsif ($state == $STATE_EXPAND_WORD) # Read elements and append them to the new word
+        {
+            push(@{$words{$name}}, $element);
+            print "\t>>> Extend word '$name' with '$element'\n" if $debug;
+        }
+        elsif ($element eq ':') # Begin of word definition
+        {
+            $statistics{'Word definitions'}++;
+            die "Word definition not in run mode!\n" if $state != $STATE_RUN;
+            $state = $STATE_START_WORD;
+            print "\t>>> ':' found\n" if $debug;
+        }
+
+        ### Handle if-else-then construction.
+        elsif ($state == $STATE_EXECUTE_IF)
+        {
+            print "\t>>> State is STATE_EXECUTE_IF\n" if $debug;
+            die "Internal error processing if-construction!\n" unless ref($element);
+            $block_result = execute($element) if $condition; # The result code could be BREAK_EXECUTED and has to be handled.
+            $state = $STATE_IF_COMPLETED;
+            return $block_result if $block_result && $block_result == $BREAK_EXECUTED;
+        }
+        elsif ($state == $STATE_EXECUTE_ELSE)
+        {
+            $statistics{'Else'}++;
+            print "\t>>> State is STATE_EXECUTE_ELSE\n" if $debug;
+            die "Internal error executing else-construction!\n" unless ref($element);
+            $block_result = execute($element) unless $condition;
+            $state = $STATE_RUN;
+            return $block_result if $block_result && $block_result == $BREAK_EXECUTED;
+        }
+
+        ### Handle do-loop constructions.
+        elsif ($state == $STATE_EXECUTE_DO)
+        {
+            print "\t>>> State is STATE_EXECUTE_DO\n" if $debug;
+            die "Internal error executing do-loop!\n" unless ref($element);
+            my $result = 0;
+            while (!$result)
+            {
+                $result = execute($element);
+                print "\t>>> Loop exited by break!\n" if $debug and $result == $BREAK_EXECUTED;
+            }
+            $state = $STATE_RUN;
+        }
+
+        ### The following block executes either builtin words or previously defined words
+        elsif ($element eq 'if')
+        {
+            print "\t>>> Execute if\n" if $debug;
+            $statistics{'If'}++;
+            $condition = pop @data_stack;
+            $state = $STATE_EXECUTE_IF;
+        }
+        elsif ($element eq 'else')
+        {
+            die "Else not within if-context!\n";
+        }
+        elsif ($element eq 'do') # Execute a do-loop structure
+        {
+            print "\t>>> Executing a do loop.\n" if $debug;
+            $statistics{'Do...Loop'}++;
+            $state = $STATE_EXECUTE_DO;
+        }
+        elsif ($element eq 'break') # Are we in a loop to be terminated?
+        {
+            print "\t>>> Execute break.\n" if $debug;
+            $statistics{'Break'}++;
+            return $BREAK_EXECUTED;
+        }
+        elsif ($element =~ m/^'/) # Quoted element, just push it onto the data stack
+        {
+            print "\t>>> Push quoted element '$element'\n" if $debug;
+            $statistics{'Push quoted elements'}++;
+            push(@data_stack, substr($element, 1));
+        }
+        elsif ($functions{$element}) # Execute a builtin word
+        {
+            print "\t>>> Execute '$element'\n" if $debug;
+            $statistics{'Execute built-in function'}++;
+            $functions{$element}();
+        }
+        elsif ($niladic{$element}) # Execute a niladic operation
+        {
+            print "\t>>> Execute niladic operation $element\n" if $debug;
+            $statistics{'Niladic'}++;
+            push(@data_stack, $niladic{$element}->());
+        }
+        elsif ($un_op{$element}) # Execute an unary operation
+        {
+            check_stack($element, 'X') or next;
+            print "\t>>> Executing unary operation $element\n" if $debug;
+            $statistics{'Unary'}++;
+            unary($un_op{$element}, $data_stack[-1]);
+        }
+        elsif ($bin_op{$element}) # Execute a binary operation
+        {
+            check_stack($element, 'XX') or next;
+            print "\t>>> Executing binary operation $element\n" if $debug;
+            $statistics{'Binary'}++;
+            binary($bin_op{$element}, $data_stack[-1], $data_stack[-2]); # Modify TOS - 1 and
+            pop @data_stack;                                             # get rid of TOS.
+        }
+        elsif ($words{$element}) # Execute a defined word
+        {
+            $statistics{'Execute words'}++;
+            execute($words{$element});
+        }
+
+        ### If the current element is the name of a variable, push its contents onto the data stack
+        elsif (defined($variables{$element}))
+        {
+            print "\t>>> Push contents of variable $element onto stack\n" if $debug;
+            $statistics{'Push variable'}++;
+            push(@data_stack, $variables{$element});
+        }
+
+        ### If nothing else worked up to now, just push the element to the data stack
+        else
+        {
+            panic("Don't know what to do with '$element'.") and next 
+                if $element !~ m/^[+-]?\d+(\.\d*)*(E[+-]?\d+)?$/ and $element !~ m/^\".*\"$/ and !ref($element);
+            print "\t>>> Push '$element'\n" if $debug;
+            $statistics{'Push data'}++;
+            push(@data_stack, $element eq 'undef' ? undef : $element);
+        }
+    }
+
+    return 0;
+}
+
+# Since the parser splits its input on every whitespace a routine is necessary to detect the definition of nested
+# arrays which are then converted into real datastructures pushed to the data stack - this is what this subroutine does.
+sub transmogrify_arrays 
+{
+    my ($prog) = @_;
+
+    my $i = 0;
+    my @arrays;
+    for (;;)
+    {
+        print "Something horrible happened in an array definition!\n" and return 0 unless defined($prog->[$i]);
+        if ($prog->[$i] eq '[') 
+        {
+            push(@arrays, []);
+            splice @$prog, $i, 1;
+            next;
+        }
+
+        if ($prog->[$i] eq ']') 
+        {
+            my $aref = pop @arrays;
+            if (@arrays) 
+            {
+                push(@{$arrays[-1]}, $aref);
+                splice @$prog, $i, 1;
+            } 
+            else 
+            {
+                $prog->[$i] = $aref;
+            }
+            next;
+        }
+
+        if (@arrays) 
+        {
+            push(@{$arrays[-1]}, $prog->[$i]);
+            splice @$prog, $i, 1;
+            next;
+        }
+
+        last if ++$i >= @$prog;
+    }
+
+    return 1;
+}
+
+# if and do structures are represented within a program as nested arrays. This subroutine loops over the raw program 
+# represented by an array of words and values and returns a nested structure representing the logical structure of all 
+# embedded if-else-then and do-loop constructions.
+sub if_do_structures
+{
+    my ($prog) = @_;
+    my @program;
+
+    my $current = \@program;
+    my @stack;
+    for my $element (@$prog)
+    {
+        if ($element eq 'if' or $element eq 'do')
+        {
+            push(@$current, $element);
+            push(@$current, []);
+            push(@stack, $current);
+            $current = $current->[-1];
+        }
+        elsif ($element eq 'else')
+        {
+            $current = $stack[-1];
+            push(@$current, $element);
+            push(@$current, []);
+            $current = $current->[-1];
+        }
+        elsif ($element eq 'then' or $element eq 'loop')
+        {
+            $current = pop @stack;
+        }
+        else
+        {
+            push(@$current, $element);
+        }
+    }
+
+    return \@program;
+}
+
+# Strings enclosed in double quotes have been converted into hex ASCII representation to avoid getting them split by
+# the simple parser. After parsing the program, these strings have to be converted back into readable text which is done here.
+# Note that strings can be recognized throughout the interpreter by their enclosing double quotes which are retained.
+sub cleanup_strings
+{
+    my ($prog) = @_;
+
+    for my $element (@$prog)
+    {
+        if (ref($element))
+        {
+            cleanup_strings($element);
+        }
+        elsif ($element =~ m/^".*"$/)
+        {
+            $element =~ s/([a-fA-F0-9]{2})/chr(hex($1))/eg;
+        }
+    }
+}
+
+# Process a single line of code read from either a source file of stdin. The result elements 
+# of this line will be returned as elements of a one dimensional array.
+sub parse_source_line
+{
+    my ($line) = @_;
+    $line =~ s/(.)/ord($1) > 127 ? ' ' : $1/egs; # Remove control characters resulting from sloppy typing!
+    $line =~ s/#.*$//;
+
+    $line =~ s/\\"/__CTDQ__/g;
+
+    # Represent strings as a sequence of hex nibbles to avoid whitespace which would confuse the scanner/parser.
+    $line =~ s/"(.*?)"/__SPLIT__"$1"__SPLIT__/g;
+    my @parts = split(/__SPLIT__/, $line);
+    for my $part (@parts)
+    {
+        $part =~ s/([^"])/sprintf("%02x", ord($1))/eg if $part =~ /"/;
+    }
+    $line = join(' ', @parts);
+
+    return grep {/\S+/} map {split /([\[\]])/} split(/\s+/, $line);
+}
+
+# Execute a program which is already parsed and preprocessed.
+sub execute_program
+{
+    my ($prog, $interactive) = @_;
+
+    unless (transmogrify_arrays($prog))                                       # Bring arrays back into shape - 
+    {                                                                         # returns 0 if something went wrong.
+        die "Fatal error while reading a source file!\n" unless $interactive; # Only die when processing a file.
+        return;                                                               # If run interactively, just abort execution.
+    }
+    
+    my $program = if_do_structures($prog); # Create nested substructures for ifs and loops.
+    cleanup_strings($program);             # Convert strings back from hex notation to ASCII.
+    execute($program);
+}
+
+### Main program
+# First of all the two options -i and -d are processed. If no other arguments are contained in @ARGV the interpreter
+# will run in interactive mode. After these tests, @ARGV will be padded with the path to stdlib.5. Following this 
+# a loop runs over all files specified in @ARGV, reads and parses their contents and executes the resulting program.
+# If the interactive flag is set the interpreter will enter the interactive mode afterwards.
+
+my $print_statistics;
+Getopt::Long::Configure ('bundling');
+GetOptions ('d' => \$debug, 'i' => \$interactive, 's' => \$print_statistics, 'w=s' => \$terminal_width);
+$interactive = 1 if @ARGV == 0;
+
+my ($filename, $dir) = fileparse($0);
+unshift(@ARGV, glob($dir . '*lib.5'));
+
+my @prog;
+for my $name (@ARGV)
+{
+    print "Reading $name...\n" if $debug;
+    open(my $fh, '<', $name) or die "Could not open $name for reading: $!\n";
+    while (my $line = <$fh>)
+    {
+        next unless $line;
+        push(@prog, parse_source_line($line));
+    }
+    close($fh);
+}
+execute_program(\@prog, 0) if @prog > 0;
+
+if ($interactive) # This loop reads line by line from stdin, parses and executes the input.
+{
+    for(;;)
+    {
+        my @prog;
+        print '5> ';
+        my $line = <STDIN>;
+        last unless $line;
+        next if $line =~ m/^\s*$/;
+
+        push(@prog, parse_source_line($line));
+        execute_program(\@prog, 1);
+        last if $exit_executed;
+    }
+    print "\n";
+}
+
+if ($print_statistics)
+{
+    print '=' x 79, "\nStatistics:\n", '-' x 79, "\n";
+    my $counter = 0;
+    for my $key (sort(keys(%statistics)))
+    {
+        printf "%-25s: %10d ! ", $key, $statistics{$key};
+        print "\n" if !(++$counter % 2);
+    }
+    print "\n" if $counter % 2;
+    print '-' x 79, "\n";
+}
